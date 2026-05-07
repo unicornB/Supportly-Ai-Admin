@@ -1,12 +1,13 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { RefreshCw } from "lucide-react";
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { useParams } from "react-router-dom";
 import { Button } from "../../../shared/components/Button";
 import { Panel } from "../../../shared/components/Panel";
 import { EmptyState, ErrorState, LoadingState } from "../../../shared/components/StatusView";
 import { listChannels } from "../../channels/api";
 import {
+  createAdminWebSocket,
   getConversation,
   listConversations,
   listMessages,
@@ -18,7 +19,8 @@ import { ConversationList } from "../components/ConversationList";
 import { ConversationSidebar } from "../components/ConversationSidebar";
 import { MessageTimeline } from "../components/MessageTimeline";
 import { ReplyComposer } from "../components/ReplyComposer";
-import type { Conversation } from "../types";
+import type { AdminRealtimeEvent } from "../api";
+import type { Conversation, Message } from "../types";
 
 const conversationKeys = {
   all: ["conversations"] as const,
@@ -33,11 +35,12 @@ const channelKeys = {
 export function ConversationsPage() {
   const { conversationId } = useParams();
   const queryClient = useQueryClient();
+  const conversationIdRef = useRef<string | undefined>(conversationId);
+  const messagesRef = useRef<Message[]>([]);
 
   const conversationsQuery = useQuery({
     queryKey: conversationKeys.all,
-    queryFn: listConversations,
-    refetchInterval: 5_000
+    queryFn: listConversations
   });
 
   const channelsQuery = useQuery({
@@ -65,11 +68,18 @@ export function ConversationsPage() {
   const messagesQuery = useQuery({
     queryKey: conversationKeys.messages(conversationId ?? ""),
     queryFn: () => listMessages(conversationId!),
-    enabled: Boolean(conversationId),
-    refetchInterval: 3_000
+    enabled: Boolean(conversationId)
   });
 
   const selectedConversation = conversationQuery.data ?? selectedFromList;
+
+  useEffect(() => {
+    conversationIdRef.current = conversationId;
+  }, [conversationId]);
+
+  useEffect(() => {
+    messagesRef.current = messagesQuery.data ?? [];
+  }, [messagesQuery.data]);
 
   function markConversationReadInCache(id: string) {
     queryClient.setQueryData<Conversation[]>(conversationKeys.all, (current) =>
@@ -87,14 +97,90 @@ export function ConversationsPage() {
     markConversationReadInCache(conversationId);
   }, [conversationId, messagesQuery.data]);
 
+  useEffect(() => {
+    let closedByEffect = false;
+    let reconnectTimer: number | undefined;
+    let reconnectAttempt = 0;
+    let socket: WebSocket | null = null;
+
+    function scheduleReconnect() {
+      if (closedByEffect) return;
+      const delays = [1000, 2000, 5000, 10000, 30000];
+      const delay = delays[Math.min(reconnectAttempt, delays.length - 1)];
+      reconnectAttempt += 1;
+      reconnectTimer = window.setTimeout(connect, delay);
+    }
+
+    function connect() {
+      if (closedByEffect) return;
+      socket = createAdminWebSocket();
+
+      socket.onopen = () => {
+        reconnectAttempt = 0;
+        void queryClient.invalidateQueries({ queryKey: conversationKeys.all });
+
+        const activeConversationId = conversationIdRef.current;
+        if (!activeConversationId) return;
+
+        const afterMessageId = getLastRemoteMessageId(messagesRef.current);
+        void listMessages(activeConversationId, afterMessageId).then((messages) => {
+          queryClient.setQueryData<Message[]>(conversationKeys.messages(activeConversationId), (current) =>
+            mergeMessageList(current, messages)
+          );
+        });
+      };
+
+      socket.onmessage = (event) => {
+        const realtimeEvent = parseAdminRealtimeEvent(event.data);
+        if (!realtimeEvent) return;
+
+        if (realtimeEvent.type === "conversation.updated") {
+          const activeConversationId = conversationIdRef.current;
+          const conversation =
+            realtimeEvent.conversation.id === activeConversationId
+              ? { ...realtimeEvent.conversation, unreadCount: 0 }
+              : realtimeEvent.conversation;
+          queryClient.setQueryData<Conversation[]>(conversationKeys.all, (current) =>
+            upsertConversationList(current, conversation)
+          );
+          queryClient.setQueryData<Conversation>(conversationKeys.detail(conversation.id), conversation);
+          return;
+        }
+
+        if (realtimeEvent.type === "message.new") {
+          const activeConversationId = conversationIdRef.current;
+          if (realtimeEvent.conversationId === activeConversationId) {
+            queryClient.setQueryData<Message[]>(conversationKeys.messages(realtimeEvent.conversationId), (current) =>
+              mergeMessageList(current, [realtimeEvent.message])
+            );
+            markConversationReadInCache(realtimeEvent.conversationId);
+          }
+        }
+      };
+
+      socket.onclose = () => {
+        socket = null;
+        scheduleReconnect();
+      };
+    }
+
+    connect();
+
+    return () => {
+      closedByEffect = true;
+      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      socket?.close();
+    };
+  }, [queryClient]);
+
   const sendMutation = useMutation({
-    mutationFn: (content: string) => sendMessage(conversationId!, content),
-    onSuccess: async () => {
+    mutationFn: (content: string) => sendMessage(conversationId!, content, `admin_${randomId()}`),
+    onSuccess: async (message) => {
       if (!conversationId) return;
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: conversationKeys.messages(conversationId) }),
-        queryClient.invalidateQueries({ queryKey: conversationKeys.all })
-      ]);
+      queryClient.setQueryData<Message[]>(conversationKeys.messages(conversationId), (current) =>
+        mergeMessageList(current, [message])
+      );
+      await queryClient.invalidateQueries({ queryKey: conversationKeys.all });
     }
   });
 
@@ -215,4 +301,50 @@ export function ConversationsPage() {
       </div>
     </div>
   );
+}
+
+function parseAdminRealtimeEvent(value: unknown): AdminRealtimeEvent | null {
+  if (typeof value !== "string") return null;
+  try {
+    const event = JSON.parse(value) as AdminRealtimeEvent;
+    return event && typeof event.type === "string" ? event : null;
+  } catch {
+    return null;
+  }
+}
+
+function mergeMessageList(current: Message[] | undefined, items: Message[]): Message[] {
+  if (items.length === 0) return current ?? [];
+
+  const merged = new Map((current ?? []).map((message) => [message.id, message]));
+  for (const item of items) {
+    merged.set(item.id, item);
+  }
+
+  return Array.from(merged.values()).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+}
+
+function upsertConversationList(current: Conversation[] | undefined, item: Conversation): Conversation[] {
+  const merged = new Map((current ?? []).map((conversation) => [conversation.id, conversation]));
+  if (item.status === "open") {
+    merged.set(item.id, item);
+  } else {
+    merged.delete(item.id);
+  }
+
+  return Array.from(merged.values()).sort((a, b) => {
+    const byMessageAt = (b.lastMessageAt ?? "").localeCompare(a.lastMessageAt ?? "");
+    return byMessageAt || b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id);
+  });
+}
+
+function getLastRemoteMessageId(messages: Message[]): string | undefined {
+  return messages[messages.length - 1]?.id;
+}
+
+function randomId(): string {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }

@@ -1,4 +1,5 @@
 import { Bot, UserRound } from "lucide-react";
+import { useEffect, useRef } from "react";
 import { Badge } from "../../../shared/components/Badge";
 import { EmptyState, ErrorState, LoadingState } from "../../../shared/components/StatusView";
 import { cn } from "../../../shared/utils/cn";
@@ -15,12 +16,27 @@ type MessageTimelineProps = {
 };
 
 export function MessageTimeline({ messages, isLoading, error, onRetry }: MessageTimelineProps) {
+  const listRef = useRef<HTMLDivElement>(null);
+  const lastMessageId = messages?.[messages.length - 1]?.id;
+
+  useEffect(() => {
+    if (!lastMessageId) return;
+    const frame = window.requestAnimationFrame(() => {
+      listRef.current?.scrollTo({
+        top: listRef.current.scrollHeight,
+        behavior: "smooth",
+      });
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [lastMessageId]);
+
   if (isLoading) return <LoadingState />;
   if (error) return <ErrorState error={error} onRetry={onRetry} />;
   if (!messages?.length) return <EmptyState title="暂无消息" />;
 
   return (
-    <div className="scrollbar-thin flex h-full flex-col gap-4 overflow-y-auto px-5 py-4">
+    <div ref={listRef} className="scrollbar-thin flex h-full flex-col gap-4 overflow-y-auto px-5 py-4">
       {messages.map((message) => {
         const outbound = message.direction === "outbound";
         const references = parseAiReferences(message);

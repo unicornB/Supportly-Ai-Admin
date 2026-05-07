@@ -39,6 +39,7 @@ export type Message = {
   direction: MessageDirection;
   senderType: SenderType;
   senderAdminUserId: string | null;
+  clientMessageId: string | null;
   messageType: MessageType;
   content: string | null;
   attachmentsJson: string;
